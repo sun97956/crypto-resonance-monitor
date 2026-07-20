@@ -57,12 +57,12 @@ python monitor.py
 
 ### 方式 A：Linux / macOS — crontab
 
-每 15 分钟执行一次：
+每 5 分钟执行一次：
 
 ```bash
 crontab -e
 # 添加：
-*/15 * * * * cd /path/to/crypto-resonance-monitor && /usr/bin/python3 monitor.py >> run.log 2>&1
+*/5 * * * * cd /path/to/crypto-resonance-monitor && /usr/bin/python3 monitor.py >> run.log 2>&1
 ```
 
 > 脚本无命中时不产生任何输出，不会刷日志。
@@ -70,12 +70,12 @@ crontab -e
 ### 方式 B：Windows — 任务计划程序
 
 1. 打开"任务计划程序" → 创建基本任务。
-2. 触发器：每天，重复间隔 15 分钟。
+2. 触发器：每天，重复间隔 5 分钟。
 3. 操作：启动程序 `python`，参数 `monitor.py`，起始于项目目录。
 
 ### 方式 C：Hermes（桌面端）
 
-若使用 Hermes，可将脚本挂为 `no_agent` cron 任务（脚本路径相对 `~/.hermes/scripts/`），每 15 分钟运行，无命中静默。
+若使用 Hermes，可将脚本挂为 `no_agent` cron 任务（脚本路径相对 `~/.hermes/scripts/`），每 5 分钟运行，无命中静默。
 
 ## 5. 自定义币池
 
