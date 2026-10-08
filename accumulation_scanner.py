@@ -1,287 +1,761 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-建仓扫描器（Accumulation Scanner）— 实时 4h 扫描 + 双日志。
+Crypto Accumulation Scanner
 
-设计原则（红线，见 ACCUMULATION_METHOD.md）：
-  - 阈值全部来自方法论文档、按统计原理冻结，运行时绝不调整。
-  - 不做涨跌预测，只标记「值得关注」。
-  - 仅币安公开 REST（免费）。CoinGecko Pro 无衍生品历史，此处不用。
-  - OI/费率/多空比历史币安仅滚动保留 ~31 天 → 本系统只验证近 31 天的泵。
+每 4h 扫描 universe.json 中的 Binance USDT 永续合约。
 
-每 4h 跑一次：
-  1) 对 universe.json 每个币算 4 维相对自身基线的 z-score
-  2) 判定 S1/S2/S3 签名，≥2 命中 → 写 accumulation_alerts.log（带时间戳）
-  3) 同时写 pumps_detected.log（24~48h 涨≥+20% 的币，供每周对账）
-  4) 冷却 24h 同币不重复告警
-  5) 可选推送 Telegram（config.json 配 token/chat_id）
+核心指标：
+    1. Open Interest (OI)
+    2. 4h Price Range
+    3. Funding Rate
+    4. Long / Short Ratio
 
-运行：python accumulation_scanner.py
+计算每个指标相对自身历史基线的 z-score，
+并通过 S1 / S2 / S3 accumulation signatures
+筛选值得关注的结构性信号。
+
+系统定位：
+    - 不预测价格
+    - 不自动交易
+    - 不动态调参
+    - 只发现值得进一步研究的信号
+
+运行：
+    python accumulation_scanner.py
 """
+
 import os
 import sys
 import json
 import time
 import datetime
 import statistics
-
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
-
 import subprocess
+import threading
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
 
+
+# ============================================================
+# Paths
+# ============================================================
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UNIV_PATH = os.path.join(BASE_DIR, "universe.json")
-CFG_PATH = os.path.join(BASE_DIR, "config.json")
-ALERT_LOG = os.path.join(BASE_DIR, "accumulation_alerts.log")
-PUMP_LOG = os.path.join(BASE_DIR, "pumps_detected.log")
-BIN = "https://fapi.binance.com"
 
-# ===== 冻结参数（来自 ACCUMULATION_METHOD.md，原理驱动，不得运行时调整）=====
-OI_Z_TH = 2.0          # 2σ 上尾
-RANGE_Z_FLAT = -1.0    # 价格区间 1σ 下尾 = 异常平静
-FR_Z_MAX = 0.0         # 费率不高于自身基线
-LS_Z_MAX = -1.5        # 1.5σ 下尾 = 异常净空
-PERSIST_WIN = 6        # OI 异常须连续 ≥6 窗口 ≈24h
-MIN_SIG = 2            # S1/S2/S3 至少满足 2 个
-COOLDOWN_H = 24
-KLINE_LIMIT = 4 * 24 * 7 + 12   # 近 7 天 4h K线 + 余量 ≈ 84
-OI_LIMIT = 31 * 24     # 31 天每小时 OI（接口约 744 上限）
-WIN_4H = 42            # z 基线窗口 = 近 7 天（每 4h=42 根）
-PUMP_PCT = 0.20        # 24~48h 涨≥20% 记为泵
+UNIVERSE_PATH = os.path.join(
+    BASE_DIR,
+    "universe.json",
+)
+
+ALERT_LOG_PATH = os.path.join(
+    BASE_DIR,
+    "accumulation_alerts.log",
+)
+
+STATE_PATH = os.path.join(
+    BASE_DIR,
+    "alert_state.json",
+)
+
+BINANCE_FAPI = "https://fapi.binance.com"
 
 
-def _curl_json(url, params=None):
-    """curl 兜底：币安对 Python requests 偶发 451/SSL EOF，curl 实测更稳。"""
+# ============================================================
+# Frozen strategy parameters
+# ============================================================
+
+OI_Z_THRESHOLD = 2.0
+RANGE_Z_FLAT = -1.0
+FUNDING_Z_MAX = 0.0
+LONG_SHORT_Z_MAX = -1.5
+
+OI_PERSISTENCE_WINDOWS = 6
+MIN_SIGNATURES = 2
+COOLDOWN_HOURS = 24
+
+# 42 个 4h 基线窗口 + 额外窗口用于 persistence
+BASELINE_4H_WINDOWS = 42
+KLINE_LIMIT = 60
+
+# OI 为 1h 数据，只需要覆盖最近约 9 天即可完成
+# 42 个 4h baseline + 6 个 persistence windows。
+OI_LIMIT = 220
+
+# Funding 默认每 8h 一次，200 条已经远超所需窗口。
+FUNDING_LIMIT = 200
+
+# Long/Short 使用 4h 数据，100 条已经足够。
+LONG_SHORT_LIMIT = 100
+
+
+# ============================================================
+# Performance
+# ============================================================
+
+MAX_WORKERS = 12
+
+REQUEST_TIMEOUT = (5, 15)
+REQUEST_RETRIES = 2
+
+_thread_local = threading.local()
+
+
+def get_session():
+    """为每个线程复用一个 requests Session。"""
+
+    if not hasattr(_thread_local, "session"):
+        session = requests.Session()
+
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; Win64; x64)"
+            )
+        })
+
+        _thread_local.session = session
+
+    return _thread_local.session
+
+
+# ============================================================
+# HTTP
+# ============================================================
+
+def curl_json(url, params=None):
+    """
+    requests 无法访问 Binance 时使用 curl fallback。
+    """
+
     try:
-        import urllib.parse
-        full = url
+        from urllib.parse import urlencode
+
+        full_url = url
+
         if params:
-            full = url + "?" + urllib.parse.urlencode(params)
-        out = subprocess.run(
-            ["curl", "-s", "-A",
-             "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", full],
-            capture_output=True, text=True, timeout=30)
-        return json.loads(out.stdout)
+            full_url = f"{url}?{urlencode(params)}"
+
+        result = subprocess.run(
+            [
+                "curl",
+                "-s",
+                "--max-time",
+                "15",
+                "-A",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                full_url,
+            ],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=20,
+        )
+
+        if not result.stdout:
+            return None
+
+        return json.loads(result.stdout)
+
     except Exception:
         return None
 
 
-def get_json(url, params=None, retries=3, backoff=2.0):
-    """优先 requests（带重试+退避），失败回退 curl。应对币安 451/SSL EOF。"""
-    last = None
-    for attempt in range(retries):
+def get_json(url, params=None):
+    """
+    高效请求 Binance API。
+
+    4xx 中的 403 / 418 / 451 直接 fallback curl，
+    避免无意义等待。
+
+    429 / 5xx 才进行短暂 retry。
+    """
+
+    session = get_session()
+
+    for attempt in range(REQUEST_RETRIES):
+
         try:
-            r = requests.get(url, params=params, timeout=25)
-            if r.ok:
-                return r.json()
-            last = r.status_code
-        except Exception as e:
-            last = e
-        if attempt < retries - 1:
-            time.sleep(backoff * (attempt + 1))
-    # requests 连续失败 → 回退 curl（仅一次，curl 本身稳）
-    c = _curl_json(url, params)
-    if c is not None:
-        return c
-    if isinstance(last, Exception):
-        print(f"GET_ERR {url}: {last}")
-    return None
+            response = session.get(
+                url,
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if response.ok:
+                return response.json()
+
+            status = response.status_code
+
+            # Binance 常见网络访问限制：
+            # 不再重复等待，直接尝试 curl。
+            if status in (403, 418, 451):
+                break
+
+            # Rate limit / server error
+            if status == 429 or status >= 500:
+                if attempt < REQUEST_RETRIES - 1:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+
+            return None
+
+        except Exception:
+
+            if attempt < REQUEST_RETRIES - 1:
+                time.sleep(1.0 * (attempt + 1))
+
+    return curl_json(url, params)
 
 
-def z_last(vals, win):
-    """返回最后一点相对其之前 win 窗口的 z-score；数据不足/扁平返回 0.0。"""
-    n = len(vals)
-    if n < win + 2:
+# ============================================================
+# Statistics
+# ============================================================
+
+def z_last(values, baseline_window):
+    """
+    最后一个值相对之前 baseline_window 个值的 z-score。
+    """
+
+    if len(values) < baseline_window + 2:
         return 0.0
-    window = vals[-(win + 1):-1]
-    mu = statistics.fmean(window)
-    sd = statistics.pstdev(window)
-    if sd < 1e-12:
+
+    baseline = values[-(baseline_window + 1):-1]
+
+    mean = statistics.fmean(baseline)
+    std = statistics.pstdev(baseline)
+
+    if std < 1e-12:
         return 0.0
-    return (vals[-1] - mu) / sd
+
+    return (values[-1] - mean) / std
 
 
-def at_ffill(times, vals, t, last):
-    """前向填充：取 ≤t 的最近值，缺失用 last。"""
-    best = last
-    for tt, vv in zip(times, vals):
-        if tt <= t:
-            best = vv
+def forward_fill(times, values, target_time, last_value):
+    """
+    使用 <= target_time 的最近值。
+    """
+
+    best = last_value
+
+    for timestamp, value in zip(times, values):
+
+        if timestamp <= target_time:
+            best = value
         else:
             break
+
     return best
 
 
-def analyze(symbol):
-    """返回 (signs:set, detail:dict)。无数据返回 (set(), {})。"""
-    st = int((datetime.datetime.utcnow() - datetime.timedelta(days=32)).timestamp() * 1000)
+# ============================================================
+# Local state
+# ============================================================
 
-    k = get_json(f"{BIN}/fapi/v1/klines",
-                 {"symbol": symbol, "interval": "4h", "limit": KLINE_LIMIT})
-    if not k:
-        return set(), {}
-    kt = [datetime.datetime.utcfromtimestamp(x[0] / 1000) for x in k]
-    op = [float(x[1]) for x in k]
-    cl = [float(x[4]) for x in k]
-    amp = [abs(c / o - 1) for o, c in zip(op, cl)]   # 4h 实体振幅 = 价格区间
+def load_universe():
+    if not os.path.exists(UNIVERSE_PATH):
+        raise FileNotFoundError(
+            "找不到 universe.json"
+        )
 
-    oi = get_json(f"{BIN}/futures/data/openInterestHist",
-                  {"symbol": symbol, "period": "1h", "limit": OI_LIMIT})
-    oi_t = [datetime.datetime.utcfromtimestamp(x["timestamp"] / 1000) for x in oi] if oi else []
-    oi_v = [float(x["sumOpenInterestValue"]) for x in oi] if oi else []
+    with open(
+        UNIVERSE_PATH,
+        "r",
+        encoding="utf-8",
+    ) as f:
 
-    fr = get_json(f"{BIN}/fapi/v1/fundingRate", {"symbol": symbol, "limit": 1000})
-    fr_t = [datetime.datetime.utcfromtimestamp(x["fundingTime"] / 1000) for x in fr] if fr else []
-    fr_v = [float(x["fundingRate"]) for x in fr] if fr else []
+        universe = json.load(f)
 
-    ls = get_json(f"{BIN}/futures/data/globalLongShortAccountRatio",
-                  {"symbol": symbol, "period": "4h", "limit": 500})
-    ls_t = [datetime.datetime.utcfromtimestamp(x["timestamp"] / 1000) for x in ls] if ls else []
-    ls_v = [float(x["longAccount"]) for x in ls] if ls else []
+    if not isinstance(universe, list):
+        raise ValueError(
+            "universe.json 必须是 symbol 列表"
+        )
 
-    # 逐 4h 棒累积（前向填充避免 None）
-    oi_hist, fr_hist, ls_hist = [], [], []
-    oi_last = fr_last = ls_last = None
-    oi_z_series, flat_series, fr_z_series, ls_z_series = [], [], [], []
-    for i, t in enumerate(kt):
-        oi_last = at_ffill(oi_t, oi_v, t, oi_last)
-        fr_last = at_ffill(fr_t, fr_v, t, fr_last)
-        ls_last = at_ffill(ls_t, ls_v, t, ls_last)
+    return universe
+
+
+def load_alert_state():
+
+    if not os.path.exists(STATE_PATH):
+        return {}
+
+    try:
+
+        with open(
+            STATE_PATH,
+            "r",
+            encoding="utf-8",
+        ) as f:
+
+            state = json.load(f)
+
+        return (
+            state
+            if isinstance(state, dict)
+            else {}
+        )
+
+    except Exception:
+        return {}
+
+
+def save_alert_state(state):
+
+    with open(
+        STATE_PATH,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            state,
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+# ============================================================
+# Analyze one symbol
+# ============================================================
+
+def analyze_symbol(symbol):
+    """
+    分析单个交易对。
+
+    Returns:
+        symbol, signs, detail
+    """
+
+    # --------------------------------------------------------
+    # 1. 4h Kline
+    # --------------------------------------------------------
+
+    klines = get_json(
+        f"{BINANCE_FAPI}/fapi/v1/klines",
+        {
+            "symbol": symbol,
+            "interval": "4h",
+            "limit": KLINE_LIMIT,
+        },
+    )
+
+    if not klines:
+        return symbol, set(), {}
+
+    candle_times = [
+        datetime.datetime.utcfromtimestamp(
+            item[0] / 1000
+        )
+        for item in klines
+    ]
+
+    opens = [
+        float(item[1])
+        for item in klines
+    ]
+
+    closes = [
+        float(item[4])
+        for item in klines
+    ]
+
+    price_ranges = [
+        abs(close / open_price - 1)
+        for open_price, close
+        in zip(opens, closes)
+        if open_price != 0
+    ]
+
+    # --------------------------------------------------------
+    # 2. Open Interest
+    # --------------------------------------------------------
+
+    oi_data = get_json(
+        f"{BINANCE_FAPI}/futures/data/openInterestHist",
+        {
+            "symbol": symbol,
+            "period": "1h",
+            "limit": OI_LIMIT,
+        },
+    )
+
+    oi_times = [
+        datetime.datetime.utcfromtimestamp(
+            item["timestamp"] / 1000
+        )
+        for item in oi_data
+    ] if oi_data else []
+
+    oi_values = [
+        float(item["sumOpenInterestValue"])
+        for item in oi_data
+    ] if oi_data else []
+
+    # --------------------------------------------------------
+    # 3. Funding Rate
+    # --------------------------------------------------------
+
+    funding_data = get_json(
+        f"{BINANCE_FAPI}/fapi/v1/fundingRate",
+        {
+            "symbol": symbol,
+            "limit": FUNDING_LIMIT,
+        },
+    )
+
+    funding_times = [
+        datetime.datetime.utcfromtimestamp(
+            item["fundingTime"] / 1000
+        )
+        for item in funding_data
+    ] if funding_data else []
+
+    funding_values = [
+        float(item["fundingRate"])
+        for item in funding_data
+    ] if funding_data else []
+
+    # --------------------------------------------------------
+    # 4. Long / Short Ratio
+    # --------------------------------------------------------
+
+    long_short_data = get_json(
+        f"{BINANCE_FAPI}/futures/data/globalLongShortAccountRatio",
+        {
+            "symbol": symbol,
+            "period": "4h",
+            "limit": LONG_SHORT_LIMIT,
+        },
+    )
+
+    long_short_times = [
+        datetime.datetime.utcfromtimestamp(
+            item["timestamp"] / 1000
+        )
+        for item in long_short_data
+    ] if long_short_data else []
+
+    long_short_values = [
+        float(item["longAccount"])
+        for item in long_short_data
+    ] if long_short_data else []
+
+    # --------------------------------------------------------
+    # Align all series to 4h candles
+    # --------------------------------------------------------
+
+    oi_history = []
+    funding_history = []
+    long_short_history = []
+
+    oi_last = None
+    funding_last = None
+    long_short_last = None
+
+    oi_z_series = []
+    range_z_series = []
+    funding_z_series = []
+    long_short_z_series = []
+
+    for index, timestamp in enumerate(candle_times):
+
+        oi_last = forward_fill(
+            oi_times,
+            oi_values,
+            timestamp,
+            oi_last,
+        )
+
+        funding_last = forward_fill(
+            funding_times,
+            funding_values,
+            timestamp,
+            funding_last,
+        )
+
+        long_short_last = forward_fill(
+            long_short_times,
+            long_short_values,
+            timestamp,
+            long_short_last,
+        )
+
         if oi_last is not None:
-            oi_hist.append(oi_last)
-        if fr_last is not None:
-            fr_hist.append(fr_last)
-        if ls_last is not None:
-            ls_hist.append(ls_last)
-        oi_z_series.append(z_last(oi_hist, WIN_4H))
-        flat_series.append(z_last(amp[:i + 1], WIN_4H))
-        fr_z_series.append(z_last(fr_hist, WIN_4H))
-        ls_z_series.append(z_last(ls_hist, WIN_4H))
+            oi_history.append(oi_last)
 
-    if not oi_z_series or not flat_series:
-        return set(), {}
+        if funding_last is not None:
+            funding_history.append(
+                funding_last
+            )
 
-    # 取最后一点 + 持续计数（OI 异常连续窗口数）
+        if long_short_last is not None:
+            long_short_history.append(
+                long_short_last
+            )
+
+        oi_z_series.append(
+            z_last(
+                oi_history,
+                BASELINE_4H_WINDOWS,
+            )
+        )
+
+        range_z_series.append(
+            z_last(
+                price_ranges[:index + 1],
+                BASELINE_4H_WINDOWS,
+            )
+        )
+
+        funding_z_series.append(
+            z_last(
+                funding_history,
+                BASELINE_4H_WINDOWS,
+            )
+        )
+
+        long_short_z_series.append(
+            z_last(
+                long_short_history,
+                BASELINE_4H_WINDOWS,
+            )
+        )
+
+    if not oi_z_series:
+        return symbol, set(), {}
+
+    # --------------------------------------------------------
+    # Current z-scores
+    # --------------------------------------------------------
+
     oi_z = oi_z_series[-1]
-    range_z = flat_series[-1]
-    fr_z = fr_z_series[-1]
-    ls_z = ls_z_series[-1]
-    persist = 0
+    range_z = range_z_series[-1]
+    funding_z = funding_z_series[-1]
+    long_short_z = long_short_z_series[-1]
+
+    # --------------------------------------------------------
+    # OI persistence
+    # --------------------------------------------------------
+
+    oi_persistence = 0
+
     for z in reversed(oi_z_series):
-        if z >= OI_Z_TH:
-            persist += 1
+
+        if z >= OI_Z_THRESHOLD:
+            oi_persistence += 1
         else:
             break
 
-    # 签名
-    oi_high = (oi_z >= OI_Z_TH) and (persist >= PERSIST_WIN)
-    flat = range_z <= RANGE_Z_FLAT
-    S1 = oi_high and flat
-    S2 = oi_high and (fr_z <= FR_Z_MAX)
-    S3 = (ls_z <= LS_Z_MAX) and flat
+    oi_high = (
+        oi_z >= OI_Z_THRESHOLD
+        and oi_persistence
+        >= OI_PERSISTENCE_WINDOWS
+    )
+
+    price_flat = (
+        range_z <= RANGE_Z_FLAT
+    )
+
+    # --------------------------------------------------------
+    # Signatures
+    # --------------------------------------------------------
+
+    s1 = (
+        oi_high
+        and price_flat
+    )
+
+    s2 = (
+        oi_high
+        and funding_z <= FUNDING_Z_MAX
+    )
+
+    s3 = (
+        long_short_z <= LONG_SHORT_Z_MAX
+        and price_flat
+    )
+
     signs = set()
-    if S1:
+
+    if s1:
         signs.add("S1")
-    if S2:
+
+    if s2:
         signs.add("S2")
-    if S3:
+
+    if s3:
         signs.add("S3")
 
     detail = {
-        "oi_z": round(oi_z, 2), "oi_persist": persist,
-        "range_z": round(range_z, 2), "fr_z": round(fr_z, 2),
-        "ls_z": round(ls_z, 2),
-        "last_price": round(cl[-1], 6),
+        "oi_z": round(oi_z, 2),
+        "oi_persist": oi_persistence,
+        "range_z": round(range_z, 2),
+        "funding_z": round(funding_z, 2),
+        "long_short_z": round(
+            long_short_z,
+            2,
+        ),
+        "last_price": round(
+            closes[-1],
+            6,
+        ),
     }
-    return signs, detail
+
+    return symbol, signs, detail
 
 
-def scan_pumps(symbol):
-    """24~48h 涨幅 ≥20% 记为泵。返回 (bool, pct)。"""
-    k = get_json(f"{BIN}/fapi/v1/klines",
-                 {"symbol": symbol, "interval": "1d", "limit": 4})
-    if not k or len(k) < 3:
-        return False, 0.0
-    closes = [float(x[4]) for x in k]
-    # 24h 前 -> 现在；48h 前 -> 现在
-    p24 = (closes[-1] / closes[-2] - 1) if len(closes) >= 2 and closes[-2] else 0
-    p48 = (closes[-1] / closes[-3] - 1) if len(closes) >= 3 and closes[-3] else 0
-    pct = max(p24, p48)
-    return pct >= PUMP_PCT, round(pct * 100, 1)
+# ============================================================
+# Logging
+# ============================================================
 
+def write_alerts(timestamp, alerts):
+
+    if not alerts:
+        return
+
+    with open(
+        ALERT_LOG_PATH,
+        "a",
+        encoding="utf-8",
+    ) as f:
+
+        f.write(
+            f"\n===== "
+            f"{timestamp:%Y-%m-%d %H:%M}"
+            f" | 命中 {len(alerts)} 币 =====\n"
+        )
+
+        for symbol, signs, detail in alerts:
+
+            name = symbol.replace(
+                "USDT",
+                "",
+            )
+
+            sign_text = "".join(
+                sorted(signs)
+            )
+
+            f.write(
+                f"[{name}] "
+                f"签名={sign_text} | "
+                f"OI_z={detail['oi_z']} "
+                f"(持续{detail['oi_persist']}窗) "
+                f"Range_z={detail['range_z']} "
+                f"Funding_z={detail['funding_z']} "
+                f"LS_z={detail['long_short_z']} "
+                f"Price={detail['last_price']}\n"
+            )
+
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
-    with open(UNIV_PATH, "r", encoding="utf-8") as f:
-        universe = json.load(f)
+
+    universe = load_universe()
+    state = load_alert_state()
+
     now = datetime.datetime.now()
     now_ts = time.time()
-    print(f"[{now:%Y-%m-%d %H:%M}] 扫描 {len(universe)} 币...")
 
-    # 冷却状态
-    state = {}
-    try:
-        with open(CFG_PATH, "r", encoding="utf-8") as f:
-            state = json.load(f).get("_alert_state", {})
-    except Exception:
-        pass
+    total = len(universe)
+
+    print(
+        f"[{now:%Y-%m-%d %H:%M}] "
+        f"扫描 {total} 个标的..."
+    )
 
     alerts = []
-    pumps = []
-    for sym in universe:
-        try:
-            signs, det = analyze(sym)
-        except Exception as e:
-            print(f"  ERR {sym}: {e}")
-            continue
-        # 泵检测（每个币每次都记）
-        is_pump, pct = scan_pumps(sym)
-        if is_pump:
-            pumps.append((sym, pct))
-        # 签名判定
-        if len(signs) < MIN_SIG:
-            continue
-        last = state.get(sym, {}).get("last_ts", 0)
-        if now_ts - last < COOLDOWN_H * 3600:
-            continue
-        alerts.append((sym, signs, det))
-        state.setdefault(sym, {})["last_ts"] = now_ts
 
-    # 写告警日志
-    if alerts:
-        with open(ALERT_LOG, "a", encoding="utf-8") as f:
-            f.write(f"\n===== {now:%Y-%m-%d %H:%M} | 命中 {len(alerts)} 币 =====\n")
-            for sym, signs, det in alerts:
-                name = sym.replace("USDT", "")
-                f.write(f"[{name}] 签名 {''.join(sorted(signs))} | "
-                        f"OIz={det['oi_z']}(持续{det['oi_persist']}窗) "
-                        f"区间z={det['range_z']} 费率z={det['fr_z']} 净多z={det['ls_z']} "
-                        f"价={det['last_price']}\n")
-        # 回存冷却状态
-        try:
-            cfg = {}
+    completed = 0
+
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
+
+        futures = {
+            executor.submit(
+                analyze_symbol,
+                symbol,
+            ): symbol
+            for symbol in universe
+        }
+
+        for future in as_completed(futures):
+
+            symbol = futures[future]
+            completed += 1
+
             try:
-                with open(CFG_PATH, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-            except Exception:
-                pass
-            cfg["_alert_state"] = state
-            with open(CFG_PATH, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
 
-    # 写泵日志
-    if pumps:
-        with open(PUMP_LOG, "a", encoding="utf-8") as f:
-            f.write(f"\n===== {now:%Y-%m-%d %H:%M} | 泵 {len(pumps)} 币 =====\n")
-            for sym, pct in pumps:
-                f.write(f"[{sym.replace('USDT','')}] +{pct}%\n")
+                symbol, signs, detail = (
+                    future.result()
+                )
 
-    print(f"完成。告警 {len(alerts)} 币，泵 {len(pumps)} 币。")
+            except Exception as exc:
+
+                print(
+                    f"  ERR {symbol}: {exc}"
+                )
+
+                continue
+
+            print(
+                f"\r进度 "
+                f"{completed}/{total}",
+                end="",
+                flush=True,
+            )
+
+            # 至少命中两个 signatures
+            if len(signs) < MIN_SIGNATURES:
+                continue
+
+            last_alert_ts = (
+                state.get(symbol, {})
+                .get("last_ts", 0)
+            )
+
+            # 24h cooldown
+            if (
+                now_ts - last_alert_ts
+                < COOLDOWN_HOURS * 3600
+            ):
+                continue
+
+            alerts.append(
+                (
+                    symbol,
+                    signs,
+                    detail,
+                )
+            )
+
+            state[symbol] = {
+                "last_ts": now_ts
+            }
+
+    print()
+
+    write_alerts(
+        now,
+        alerts,
+    )
+
+    save_alert_state(
+        state
+    )
+
+    print(
+        f"完成。"
+        f"扫描 {total} 个标的，"
+        f"命中 {len(alerts)} 个。"
+    )
 
 
 if __name__ == "__main__":

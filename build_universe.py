@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-构建建仓扫描器标的池：币安中低市值永续（非前100、有 USDT 永续、正常交易）。
+构建建仓扫描器标的池：按币安 24h 成交额排名，排除前100后取300个 USDT 永续。
 输出 universe.json。仅 2 次公开请求，轻量。
 """
 import os
@@ -17,7 +17,7 @@ except Exception:
 BIN = "https://fapi.binance.com"
 BASE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(BASE, "universe.json")
-# base 名含这些的跳过（稳定币 / 法币对 / 杠杆代币）
+# 基础资产名称含这些关键词的跳过（稳定币 / 法币对 / 杠杆代币）
 EXCLUDE_HINT = ("UP", "DOWN", "BULL", "BEAR", "USD", "USDC", "TUSD", "DAI", "FDUSD", "EUR", "BTC", "ETH")
 
 
@@ -47,7 +47,7 @@ def main():
 
     ranked = sorted([s for s in syms if s in vol],
                     key=lambda s: vol[s], reverse=True)
-    # 排除前 100（大盘），只留中低市值层
+    # 排除成交额排名前 100，避免最高流动性标的占据扫描池
     mid = ranked[100:]
 
     keep = []
@@ -56,12 +56,12 @@ def main():
         if any(h in base for h in EXCLUDE_HINT):
             continue
         keep.append(s)
-        if len(keep) >= 300:   # 中部 300 个（砍前100大盘后取300）
+        if len(keep) >= 300:   # 取成交额排名前100之后的300个
             break
 
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump(keep, f, ensure_ascii=False, indent=0)
-    print(f"已写入 {len(keep)} 个中低市值永续 -> universe.json")
+    print(f"已写入 {len(keep)} 个 USDT 永续 -> universe.json")
     print("示例:", keep[:10])
 
 

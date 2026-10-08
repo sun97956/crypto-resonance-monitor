@@ -10,7 +10,7 @@ config.json
 
 # 运行时状态与日志（自动生成）
 *.log
-crypto_alert_state.json
+alert_state.json
 
 # 回测数据（体积大，不进仓；可重新拉取）
 user_data/
