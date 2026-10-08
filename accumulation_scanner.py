@@ -30,6 +30,7 @@ try:
 except Exception:
     pass
 
+import subprocess
 import requests
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,13 +54,41 @@ WIN_4H = 42            # z 基线窗口 = 近 7 天（每 4h=42 根）
 PUMP_PCT = 0.20        # 24~48h 涨≥20% 记为泵
 
 
-def get_json(url, params=None):
+def _curl_json(url, params=None):
+    """curl 兜底：币安对 Python requests 偶发 451/SSL EOF，curl 实测更稳。"""
     try:
-        r = requests.get(url, params=params, timeout=25)
-        if r.ok:
-            return r.json()
-    except Exception as e:
-        print(f"GET_ERR {url}: {e}")
+        import urllib.parse
+        full = url
+        if params:
+            full = url + "?" + urllib.parse.urlencode(params)
+        out = subprocess.run(
+            ["curl", "-s", "-A",
+             "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", full],
+            capture_output=True, text=True, timeout=30)
+        return json.loads(out.stdout)
+    except Exception:
+        return None
+
+
+def get_json(url, params=None, retries=3, backoff=2.0):
+    """优先 requests（带重试+退避），失败回退 curl。应对币安 451/SSL EOF。"""
+    last = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=25)
+            if r.ok:
+                return r.json()
+            last = r.status_code
+        except Exception as e:
+            last = e
+        if attempt < retries - 1:
+            time.sleep(backoff * (attempt + 1))
+    # requests 连续失败 → 回退 curl（仅一次，curl 本身稳）
+    c = _curl_json(url, params)
+    if c is not None:
+        return c
+    if isinstance(last, Exception):
+        print(f"GET_ERR {url}: {last}")
     return None
 
 
